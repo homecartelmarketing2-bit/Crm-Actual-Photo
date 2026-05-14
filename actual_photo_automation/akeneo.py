@@ -304,6 +304,33 @@ class AkeneoClient:
 
         return None, "not_found"
 
+    def find_by_sku(
+        self, sku: str
+    ) -> tuple[dict[str, Any] | None, str, str]:
+        """Look up an Akeneo product by SKU.
+
+        SKUs are stored as the Akeneo product ``identifier`` (variant level)
+        or product-model ``code`` (model level). This helper tries the
+        identifier path first and falls back to the model code path.
+
+        Returns ``(product_data, akeneo_id, type)`` where ``type`` is one of
+        ``'product'``, ``'product_model'``, or ``'not_found'``.
+        """
+        sku = (sku or "").strip()
+        if not sku:
+            return None, "", "not_found"
+
+        data, kind = self.find_product_or_model(sku)
+        if data is None:
+            logger.info("Akeneo: SKU not found as product or product-model: %s", sku)
+            return None, "", "not_found"
+        akeneo_id = (
+            data.get("identifier")
+            if kind == "product"
+            else data.get("code", "")
+        ) or sku
+        return data, akeneo_id, kind
+
     def product_has_actual_photos(
         self,
         product_data: dict[str, Any],

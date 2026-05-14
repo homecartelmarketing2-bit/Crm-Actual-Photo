@@ -8,27 +8,41 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from actual_photo_automation.automation import ActualPhotoAutomation
-from actual_photo_automation.helpers import MatchResult, MediaCandidate
+from actual_photo_automation.helpers import (
+    MatchResult,
+    MediaCandidate,
+    RequestItem,
+    extract_request_items,
+)
 from actual_photo_automation.upload_to_akeneo import process_records
 
 
 BASE_CONFIG = {
+    "archive_item_name_field": "Item_Name",
     "archive_media_fields": ["Image_Upload", "Video_Upload"],
     "archive_report": "Archive_Report",
+    "archive_sku_field": "SKU",
+    "archive_status_field": "Pasado_ba_sa_Quality_Check",
+    "archive_approved_value": "Approve",
     "crm_app": "crm",
     "encoding_report": "All_Encoding_Requests",
     "field_actual_media": "",
     "field_image_media": "Actual_Photo1",
     "field_product_name": "Product_Name",
     "field_remarks": "Remarks_Notes",
+    "field_request_items_subform": "Product_Name1",
     "field_request_status": "Request_Status",
     "field_request_type": "Type_of_Request",
     "field_video_media": "Video",
     "max_pending_fetch": 50,
     "max_upload_files_per_record": 15,
     "request_done_value": "Done",
+    "request_not_available_value": "Not available",
     "request_open_values": ["Pending", "In progress"],
     "request_type_value": "Actual Photo",
+    "subform_item_field": "Items",
+    "subform_item_name_field": "Item_Name",
+    "subform_sku_field": "SKU",
     "success_remarks": "This is uploaded by Automated",
     "workdrive_parent_folder_id": "folder-1",
     "workdrive_parent_folder_ids": [],
@@ -116,6 +130,7 @@ class AutomationRulesTests(unittest.TestCase):
         automation.state_path = Path(self.tempdir.name) / "processed.json"
         automation.find_archive_match = lambda product_name: None
         automation._save_state = lambda: None
+        automation.state["processed"] = {}
 
         def download_candidate(candidate: MediaCandidate, target_dir: Path) -> Path:
             destination = target_dir / candidate.name
@@ -190,6 +205,88 @@ class AutomationRulesTests(unittest.TestCase):
             "Done",
         )
         self.assertIn("Automated retrieval of actual photos/videos", creator.update_calls[0]["data"]["Remarks_Notes"])
+
+    def test_process_record_sets_not_available_when_no_media_found(self) -> None:
+        """When neither WorkDrive nor Kanban Archive yield media,
+        the row's status should flip to ``Not available``."""
+        creator = CreatorSpy()
+        automation = self._make_automation(
+            creator=creator,
+            workdrive=WorkDriveStub(match=None),
+        )
+        record = {
+            "ID": "99",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-99",
+                    "Items": {"Item_Name": "Lonely Lamp"},
+                    "SKU": "LONE-001",
+                }
+            ],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.source, "none")
+        self.assertEqual(outcome.uploaded_count, 0)
+        # Exactly one update_record call setting status to "Not available".
+        status_updates = [
+            call for call in creator.update_calls
+            if call["data"].get("Request_Status") == "Not available"
+        ]
+        self.assertEqual(len(status_updates), 1)
+
+    def test_process_record_reads_subform_and_uses_sku_for_archive(self) -> None:
+        """The subform's Item_Name drives WorkDrive search; SKU drives Archive."""
+        creator = CreatorSpy()
+        archive_calls: list[str] = []
+
+        def fake_archive(self, sku):
+            archive_calls.append(sku)
+            return None
+
+        automation = self._make_automation(creator=creator)
+        automation.find_archive_match = fake_archive.__get__(automation, ActualPhotoAutomation)
+
+        match = MatchResult(
+            source="workdrive",
+            matched_name="Ashura Modern LED Wall Light",
+            media=(MediaCandidate(source="workdrive", identifier="f-1", name="ashura.jpg"),),
+        )
+        automation.workdrive = WorkDriveStub(match=match)
+        record = {
+            "ID": "5",
+            "Product_Name": "",  # legacy field empty
+            "Product_Name1": [
+                {
+                    "ID": "row-5",
+                    "Items": {
+                        "Item_Name": "Ashura | Modern LED Wall Light/Chrome + White / Medium: D40cm",
+                        "zc_display_value": "Ashura | Modern LED Wall Light/Chrome + White / Medium: D40cm",
+                    },
+                    "SKU": "F028-M-chrome",
+                }
+            ],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.uploaded_count, 1)
+        self.assertEqual(archive_calls, ["F028-M-chrome"])
+        # WorkDrive should have been called with the Item_Name search terms.
+        self.assertEqual(len(automation.workdrive.calls), 1)
+        first_workdrive_call = automation.workdrive.calls[0]
+        search_terms = first_workdrive_call["args"][1]
+        self.assertIn("ashura", search_terms.normalized.lower())
 
     def test_process_record_failed_upload_does_not_mark_done(self) -> None:
         creator = CreatorSpy(upload_error=RuntimeError("upload failed"))
@@ -268,6 +365,54 @@ class UploadToAkeneoRulesTests(unittest.TestCase):
         self.assertEqual(counts["processed"], 0)
         self.assertEqual(counts["uploaded"], 0)
         self.assertEqual(counts["error"], 0)
+
+
+class HelperTests(unittest.TestCase):
+    def test_extract_request_items_parses_subform(self) -> None:
+        record = {
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {
+                        "Item_Name": "Ashura | Modern LED Wall Light",
+                        "zc_display_value": "Ashura | Modern LED Wall Light",
+                    },
+                    "SKU": "F028-M-chrome",
+                },
+                {
+                    "ID": "row-2",
+                    "Items": {"Item_Name": "Other Item"},
+                    "SKU": "OTHER-1",
+                },
+            ],
+        }
+
+        items = extract_request_items(record)
+
+        self.assertEqual(
+            items,
+            [
+                RequestItem(
+                    item_name="Ashura | Modern LED Wall Light",
+                    sku="F028-M-chrome",
+                ),
+                RequestItem(item_name="Other Item", sku="OTHER-1"),
+            ],
+        )
+
+    def test_extract_request_items_falls_back_to_flat_field(self) -> None:
+        record = {
+            "Product_Name": "Legacy Lamp",
+            "Product_Name1": [],
+        }
+
+        items = extract_request_items(record)
+
+        self.assertEqual(items, [RequestItem(item_name="Legacy Lamp", sku="")])
+
+    def test_extract_request_items_returns_empty_when_no_data(self) -> None:
+        self.assertEqual(extract_request_items({}), [])
 
 
 if __name__ == "__main__":

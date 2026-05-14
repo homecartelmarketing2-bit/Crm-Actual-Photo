@@ -18,6 +18,7 @@ from .helpers import (
     build_search_terms,
     creator_criteria_value,
     extract_record_id,
+    extract_request_items,
     media_kind,
     scalar_to_text,
     unique_media,
@@ -95,14 +96,19 @@ class ActualPhotoAutomation:
             max_records=limit or int(self.config["max_pending_fetch"]),
         )
 
-    def find_archive_match(self, product_name: str) -> MatchResult | None:
-        search_terms = build_search_terms(product_name)
-        query_text = search_terms.primary_keyword or product_name
-        if not query_text:
+    def find_archive_match(self, sku: str) -> MatchResult | None:
+        """Look up a Kanban Archive record by **SKU** (not by name).
+
+        The archive form has its own SKU column (see
+        ``archive_sku_field`` in config). Returns ``None`` when no approved
+        archive record matches the SKU.
+        """
+        sku = sku.strip()
+        if not sku:
             return None
 
-        criteria = self.creator.build_archive_criteria(
-            query_text, self.config["archive_approved_value"]
+        criteria = self.creator.build_archive_criteria_by_sku(
+            sku, self.config["archive_approved_value"]
         )
         archive_records = self.creator.get_records(
             self.config["workflow_app"],
@@ -113,31 +119,11 @@ class ActualPhotoAutomation:
         if not archive_records:
             return None
 
-        scored: list[tuple[int, dict[str, Any]]] = []
-        item_field = self.config["archive_item_name_field"]
-        for record in archive_records:
-            candidate_name = scalar_to_text(record.get(item_field))
-            if not candidate_name:
-                continue
-            candidate_terms = build_search_terms(candidate_name)
-            overlap = len(
-                set(search_terms.significant_tokens or search_terms.tokens)
-                & set(candidate_terms.tokens)
-            )
-            score = overlap * 10
-            if search_terms.normalized and search_terms.normalized in candidate_terms.normalized:
-                score += 50
-            if search_terms.primary_keyword and search_terms.primary_keyword in candidate_terms.tokens:
-                score += 20
-            if score > 0:
-                scored.append((score, record))
-
-        if not scored:
-            return None
-
-        scored.sort(key=lambda entry: entry[0], reverse=True)
-        _, best_record = scored[0]
+        # Archive records are SKU-matched 1:1, so just take the first hit.
+        best_record = archive_records[0]
         archive_record_id = extract_record_id(best_record)
+        item_field = self.config["archive_item_name_field"]
+        matched_name = scalar_to_text(best_record.get(item_field)) or sku
         media_fields = self.config["archive_media_fields"]
         media: list[MediaCandidate] = []
 
@@ -189,9 +175,9 @@ class ActualPhotoAutomation:
 
         return MatchResult(
             source="archive",
-            matched_name=scalar_to_text(best_record.get(item_field)),
+            matched_name=matched_name,
             media=tuple(media),
-            detail=f"Archive record {archive_record_id}",
+            detail=f"Archive record {archive_record_id} (SKU={sku})",
         )
 
     def _download_candidate(self, candidate: MediaCandidate, target_dir: Path) -> Path:
@@ -230,6 +216,27 @@ class ActualPhotoAutomation:
         }
         if change_status:
             data[self.config["field_request_status"]] = self.config["request_done_value"]
+        self.creator.update_record(
+            self.config["crm_app"],
+            self.config["encoding_report"],
+            record_id,
+            data,
+        )
+
+    def _mark_not_available(self, record_id: str, message: str) -> None:
+        """Set the Creator row status to the "Not available" picklist value.
+
+        Used when no media was found in any source so the row stops getting
+        re-fetched and the human reviewer sees a clear final status.
+        """
+        data: dict[str, Any] = {
+            self.config["field_request_status"]: self.config[
+                "request_not_available_value"
+            ],
+        }
+        remarks_field = self.config.get("field_remarks", "").strip()
+        if message and remarks_field:
+            data[remarks_field] = message
         self.creator.update_record(
             self.config["crm_app"],
             self.config["encoding_report"],
@@ -294,14 +301,28 @@ class ActualPhotoAutomation:
         return True
 
     def _record_not_found(self, record_id: str, product_name: str, message: str, *, dry_run: bool = False) -> None:
-        """#1: Update remarks and track 'not found' so we don't keep searching every cycle."""
+        """Mark the Creator row "Not available" + remarks, and remember locally.
+
+        Sets the Request_Status picklist to the configured
+        ``request_not_available_value`` (default "Not available") so the row
+        stops getting re-fetched in subsequent polling cycles.
+        """
         if dry_run:
             return
-        if message:
-            try:
-                self._update_remarks_only(record_id, message)
-            except Exception as exc:
-                logger.warning("Failed to update not-found remarks for %s: %s", record_id, exc)
+        try:
+            self._mark_not_available(record_id, message)
+        except Exception as exc:
+            logger.warning(
+                "Failed to set Not available status for %s: %s", record_id, exc
+            )
+            # Fall back to remarks-only so the human reviewer still sees the note.
+            if message:
+                try:
+                    self._update_remarks_only(record_id, message)
+                except Exception as exc2:
+                    logger.warning(
+                        "Failed to update not-found remarks for %s: %s", record_id, exc2
+                    )
         self.state.setdefault("processed", {})[record_id] = {
             "product_name": product_name,
             "source": "not_found",
@@ -310,15 +331,29 @@ class ActualPhotoAutomation:
         }
         self._save_state()
 
+    def _read_request_items(self, record: dict[str, Any]) -> list[RequestItem]:
+        return extract_request_items(
+            record,
+            subform_field=self.config.get("field_request_items_subform", "Product_Name1"),
+            item_field=self.config.get("subform_item_field", "Items"),
+            name_subfield=self.config.get("subform_item_name_field", "Item_Name"),
+            sku_field=self.config.get("subform_sku_field", "SKU"),
+            legacy_flat_field=self.config.get("field_product_name", "Product_Name"),
+        )
+
     def process_record(
         self, record: dict[str, Any], *, dry_run: bool = False
     ) -> ProcessingOutcome:
         record_id = extract_record_id(record)
-        product_name = scalar_to_text(record.get(self.config["field_product_name"]))
-        if not product_name:
-            message = "Automation could not determine Product Name."
+        items = self._read_request_items(record)
+        if not items:
+            message = "Automation could not determine Product Name or SKU."
             logger.warning("%s Record=%s", message, record_id)
             return ProcessingOutcome(record_id, "", 0, "none", message)
+
+        # For logs, remarks, and state tracking we still want a single
+        # human-friendly label. Use the first row's item name (or SKU).
+        product_name = items[0].item_name or items[0].sku
 
         request_type = scalar_to_text(record.get(self.config["field_request_type"]))
         expected_type = scalar_to_text(self.config.get("request_type_value", ""))
@@ -348,38 +383,52 @@ class ActualPhotoAutomation:
                 logger.info("%s (record=%s, product=%s)", message, record_id, product_name)
                 return ProcessingOutcome(record_id, product_name, 0, "skip", message)
 
-        search_terms = build_search_terms(product_name)
         all_media: list[MediaCandidate] = []
-        sources: list[str] = []
+        sources: set[str] = set()
         matched_name = ""
 
-        workdrive_match = self.workdrive.find_best_media_match(
-            self.config["workdrive_parent_folder_id"],
-            search_terms,
-            max_depth=int(self.config["workdrive_search_depth"]),
-            parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
-        )
-        if workdrive_match and workdrive_match.media:
-            all_media.extend(workdrive_match.media)
-            sources.append("workdrive")
-            matched_name = workdrive_match.matched_name
-            logger.info("Found %d file(s) in WorkDrive for %s", len(workdrive_match.media), product_name)
+        for item in items:
+            # WorkDrive search: by Product Name (Item_Name).
+            if item.item_name:
+                search_terms = build_search_terms(item.item_name)
+                workdrive_match = self.workdrive.find_best_media_match(
+                    self.config["workdrive_parent_folder_id"],
+                    search_terms,
+                    max_depth=int(self.config["workdrive_search_depth"]),
+                    parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
+                )
+                if workdrive_match and workdrive_match.media:
+                    all_media.extend(workdrive_match.media)
+                    sources.add("workdrive")
+                    if not matched_name:
+                        matched_name = workdrive_match.matched_name
+                    logger.info(
+                        "Found %d file(s) in WorkDrive for %s",
+                        len(workdrive_match.media), item.item_name,
+                    )
 
-        archive_match = self.find_archive_match(product_name)
-        if archive_match and archive_match.media:
-            all_media.extend(archive_match.media)
-            sources.append("archive")
-            if not matched_name:
-                matched_name = archive_match.matched_name
-            logger.info("Found %d file(s) in Archive for %s", len(archive_match.media), product_name)
+            # Kanban Archive search: by SKU (not by name).
+            if item.sku:
+                archive_match = self.find_archive_match(item.sku)
+                if archive_match and archive_match.media:
+                    all_media.extend(archive_match.media)
+                    sources.add("archive")
+                    if not matched_name:
+                        matched_name = archive_match.matched_name
+                    logger.info(
+                        "Found %d file(s) in Archive for SKU %s",
+                        len(archive_match.media), item.sku,
+                    )
 
         all_media = unique_media(all_media)
-        source_label = "+".join(sources) if sources else "none"
+        # Preserve a stable, deterministic order in the source label.
+        source_label = "+".join(s for s in ("workdrive", "archive", "akeneo") if s in sources) or "none"
+        sources_list = [s for s in ("workdrive", "archive", "akeneo") if s in sources]
 
         # Generate custom remarks dynamically based on matched sources
         source_names_map = {"archive": "Kanban Notes", "workdrive": "Zoho Drive", "akeneo": "Akeneo"}
-        display_sources = [source_names_map.get(s, s.title()) for s in sources]
-        
+        display_sources = [source_names_map.get(s, s.title()) for s in sources_list]
+
         if len(display_sources) == 1:
             sources_str = display_sources[0]
             success_msg = f"Automated retrieval of actual photos/videos from {sources_str}. Please check attachment if accurate"

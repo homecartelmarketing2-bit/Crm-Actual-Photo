@@ -18,14 +18,26 @@ try:
     from .auth import ZohoAuth
     from .config import configure_logging, load_config
     from .creator import ZohoCreator
-    from .helpers import creator_criteria_value, extract_record_id, scalar_to_text
+    from .helpers import (
+        RequestItem,
+        creator_criteria_value,
+        extract_record_id,
+        extract_request_items,
+        scalar_to_text,
+    )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from akeneo import AkeneoClient
     from auth import ZohoAuth
     from config import configure_logging, load_config
     from creator import ZohoCreator
-    from helpers import creator_criteria_value, extract_record_id, scalar_to_text
+    from helpers import (
+        RequestItem,
+        creator_criteria_value,
+        extract_record_id,
+        extract_request_items,
+        scalar_to_text,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +193,8 @@ def process_records(
     records = creator.get_records(crm_app, encoding_report, criteria=criteria, max_records=max_fetch)
     logger.info("Fetched %d records from Zoho Creator", len(records))
 
+    remarks_field = config.get("field_remarks", "").strip()
+
     for record in records:
         if limit and counts["processed"] >= limit:
             break
@@ -195,10 +209,18 @@ def process_records(
         if record_id in state.get("uploaded", {}):
             continue
 
-        product_name = scalar_to_text(record.get(config["field_product_name"]))
-        if not product_name:
-            logger.debug("Skipping record %s: no product name", record_id)
+        items = extract_request_items(
+            record,
+            subform_field=config.get("field_request_items_subform", "Product_Name1"),
+            item_field=config.get("subform_item_field", "Items"),
+            name_subfield=config.get("subform_item_name_field", "Item_Name"),
+            sku_field=config.get("subform_sku_field", "SKU"),
+            legacy_flat_field=config.get("field_product_name", "Product_Name"),
+        )
+        if not items:
+            logger.debug("Skipping record %s: no product name or SKU on request", record_id)
             continue
+        product_name = items[0].item_name or items[0].sku
 
         request_type = scalar_to_text(record.get(field_request_type))
         if request_type != request_type_value:
@@ -222,10 +244,17 @@ def process_records(
             continue
 
         counts["processed"] += 1
-        logger.info("Processing: %s (%d photos)", product_name, len(file_paths))
+        logger.info(
+            "Processing record %s: %s (%d photos, %d SKU(s))",
+            record_id, product_name, len(file_paths), len(items),
+        )
 
         if dry_run:
-            logger.info("[DRY RUN] Would upload %d photos for %s", len(file_paths), product_name)
+            sku_summary = ", ".join(item.sku or "(no SKU)" for item in items)
+            logger.info(
+                "[DRY RUN] Would upload %d photos for %s (SKUs: %s)",
+                len(file_paths), product_name, sku_summary,
+            )
             photo_names = file_paths[:3]
             append_csv_report(
                 report_path,
@@ -235,19 +264,54 @@ def process_records(
                 photo_names[0] if len(photo_names) > 0 else "",
                 photo_names[1] if len(photo_names) > 1 else "",
                 photo_names[2] if len(photo_names) > 2 else "",
-                f"{len(file_paths)} photos would be uploaded",
+                f"{len(file_paths)} photos would be uploaded to SKUs: {sku_summary}",
             )
             continue
 
-        # Find product in Akeneo by name
-        product_data, akeneo_id, product_type = akeneo.find_by_name(product_name)
-        if not product_data:
-            logger.warning("Product not found in Akeneo by name: %s", product_name)
+        # Find product in Akeneo by SKU (was: by name).
+        # When there are multiple SKUs on the same request, we attempt every
+        # SKU and surface the first one we actually find. The remaining SKUs
+        # are logged so they can be addressed manually.
+        primary_item: RequestItem | None = None
+        product_data = None
+        akeneo_id = ""
+        product_type = "not_found"
+        missing_skus: list[str] = []
+        for item in items:
+            if not item.sku:
+                missing_skus.append(f"{item.item_name or '?'}=(no SKU)")
+                continue
+            data, found_id, kind = akeneo.find_by_sku(item.sku)
+            if data is not None:
+                primary_item = item
+                product_data = data
+                akeneo_id = found_id
+                product_type = kind
+                break
+            missing_skus.append(item.sku)
+
+        if product_data is None:
+            missing_summary = ", ".join(missing_skus) or "(no SKU on request)"
+            note = (
+                f"Akeneo upload failed - SKU(s) not found: {missing_summary}"
+            )
+            logger.warning("%s (record=%s)", note, record_id)
             counts["not_found"] += 1
             append_csv_report(
                 report_path, product_name, "", "not_found_in_akeneo",
-                notes=f"No product or product-model found with name '{product_name}'",
+                notes=note,
             )
+            if remarks_field:
+                try:
+                    creator.update_record(
+                        crm_app, encoding_report, record_id,
+                        {remarks_field: note},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to write Akeneo not-found remark for %s: %s",
+                        record_id, exc,
+                    )
             state["uploaded"][record_id] = {
                 "product_name": product_name,
                 "akeneo_id": "",
@@ -257,7 +321,13 @@ def process_records(
             save_state(state, state_path)
             continue
 
-        logger.info("Found in Akeneo: %s (type=%s, code=%s)", product_name, product_type, akeneo_id)
+        logger.info(
+            "Found in Akeneo: %s (SKU=%s, type=%s, code=%s)",
+            product_name,
+            primary_item.sku if primary_item else "",
+            product_type,
+            akeneo_id,
+        )
 
         # Check if product already has actual photos
         if akeneo.product_has_actual_photos(product_data, photo_attributes):
@@ -329,14 +399,34 @@ def process_records(
         if upload_success and any(f and not f.startswith(("FAILED:", "ERROR:")) for f in uploaded_files):
             counts["uploaded"] += 1
             status = "uploaded"
+            remark_note = (
+                f"Akeneo upload OK: {product_type} {akeneo_id} "
+                f"({sum(1 for f in uploaded_files if f and not f.startswith(('FAILED:', 'ERROR:')))} photo(s))"
+            )
         else:
             counts["error"] += 1
             status = "error"
+            failures = "; ".join(f for f in uploaded_files if f and f.startswith(("FAILED:", "ERROR:"))) or "unknown error"
+            remark_note = f"Akeneo upload failed - manual check needed ({failures})"
 
         append_csv_report(
             report_path, product_name, akeneo_id, status,
             uploaded_files[0], uploaded_files[1], uploaded_files[2],
+            notes=remark_note,
         )
+        # Reflect Akeneo upload outcome on the Creator row so reviewers
+        # don't have to dig through CSV reports.
+        if remarks_field:
+            try:
+                creator.update_record(
+                    crm_app, encoding_report, record_id,
+                    {remarks_field: remark_note},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to write Akeneo result remark for %s: %s",
+                    record_id, exc,
+                )
         state["uploaded"][record_id] = {
             "product_name": product_name,
             "akeneo_id": akeneo_id,

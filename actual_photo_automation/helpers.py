@@ -79,6 +79,12 @@ class MatchResult:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class RequestItem:
+    item_name: str
+    sku: str
+
+
 def normalize_text(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower())
     return " ".join(cleaned.split())
@@ -200,3 +206,47 @@ def extract_record_id(record: dict[str, Any]) -> str:
 
 def creator_criteria_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def extract_request_items(
+    record: dict[str, Any],
+    *,
+    subform_field: str = "Product_Name1",
+    item_field: str = "Items",
+    name_subfield: str = "Item_Name",
+    sku_field: str = "SKU",
+    legacy_flat_field: str = "Product_Name",
+) -> list[RequestItem]:
+    """Extract (Item_Name, SKU) rows from the Encoding Request subform.
+
+    The Creator form holds the real product list inside a subform; the legacy
+    flat ``Product_Name`` field is empty for newer rows. When the subform is
+    empty we fall back to the flat field so older records keep working.
+    """
+    rows = record.get(subform_field)
+    items: list[RequestItem] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item_val = row.get(item_field)
+            if isinstance(item_val, dict):
+                name = scalar_to_text(
+                    item_val.get(name_subfield)
+                    or item_val.get("zc_display_value")
+                    or item_val.get("display_value")
+                )
+            else:
+                name = scalar_to_text(item_val)
+            sku = scalar_to_text(row.get(sku_field))
+            if not name and not sku:
+                continue
+            items.append(RequestItem(item_name=name, sku=sku))
+    if items:
+        return items
+
+    # Fallback for older records: only the flat Product_Name field is set.
+    legacy = scalar_to_text(record.get(legacy_flat_field))
+    if legacy:
+        items.append(RequestItem(item_name=legacy, sku=""))
+    return items
