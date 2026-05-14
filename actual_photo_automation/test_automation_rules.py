@@ -415,5 +415,131 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(extract_request_items({}), [])
 
 
+class AkeneoEmptySlotsTests(unittest.TestCase):
+    """Validates the per-slot fill-empty behaviour of the Akeneo uploader."""
+
+    def _make_client(self) -> object:
+        from actual_photo_automation.akeneo import AkeneoClient
+
+        return AkeneoClient(
+            host="http://example.test",
+            client_id="cid",
+            secret="secret",
+            username="u",
+            password="p",
+        )
+
+    def test_find_empty_photo_slots_returns_all_when_none_set(self) -> None:
+        client = self._make_client()
+        product_data = {"values": {}}
+        slots = client.find_empty_photo_slots(
+            product_data,
+            ["Actual_Photo", "another_picture_5", "another_picture_6"],
+        )
+        self.assertEqual(
+            slots, ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        )
+
+    def test_find_empty_photo_slots_skips_filled_slot_in_order(self) -> None:
+        client = self._make_client()
+        product_data = {
+            "values": {
+                "Actual_Photo": [
+                    {"scope": None, "locale": None, "data": "some/path.jpg"}
+                ],
+                # another_picture_5 has an entry but no data -> still empty
+                "another_picture_5": [{"scope": None, "locale": None, "data": ""}],
+                # another_picture_6 missing -> empty
+            }
+        }
+        slots = client.find_empty_photo_slots(
+            product_data,
+            ["Actual_Photo", "another_picture_5", "another_picture_6"],
+        )
+        # Actual_Photo is filled, others empty; order preserved.
+        self.assertEqual(slots, ["another_picture_5", "another_picture_6"])
+
+    def test_find_empty_photo_slots_returns_empty_list_when_all_full(self) -> None:
+        client = self._make_client()
+        product_data = {
+            "values": {
+                attr: [{"scope": None, "locale": None, "data": f"{attr}.jpg"}]
+                for attr in ("Actual_Photo", "another_picture_5", "another_picture_6")
+            }
+        }
+        slots = client.find_empty_photo_slots(
+            product_data,
+            ["Actual_Photo", "another_picture_5", "another_picture_6"],
+        )
+        self.assertEqual(slots, [])
+
+    def test_resolve_photo_target_returns_parent_model_for_variant(self) -> None:
+        """A product with parent= must upload to the parent product model."""
+        from actual_photo_automation.akeneo import AkeneoClient
+
+        ak = AkeneoClient(
+            host="http://example.test",
+            client_id="cid", secret="secret", username="u", password="p",
+        )
+
+        captured = {}
+
+        def fake_get_model(code: str):
+            captured["code"] = code
+            return {"code": code, "values": {}, "family_variant": "size_new"}
+
+        ak.get_product_model = fake_get_model  # type: ignore[assignment]
+
+        variant = {
+            "identifier": "SK-PU-800",
+            "parent": "devi_silk_pendant_light",
+            "family_variant": "size_new",
+            "values": {},
+        }
+        data, ident, kind = ak.resolve_photo_target(variant, "product")
+        self.assertEqual(captured["code"], "devi_silk_pendant_light")
+        self.assertEqual(kind, "product_model")
+        self.assertEqual(ident, "devi_silk_pendant_light")
+        self.assertEqual(data["code"], "devi_silk_pendant_light")
+
+    def test_resolve_photo_target_standalone_product_unchanged(self) -> None:
+        from actual_photo_automation.akeneo import AkeneoClient
+
+        ak = AkeneoClient(
+            host="http://example.test",
+            client_id="cid", secret="secret", username="u", password="p",
+        )
+        # Track whether get_product_model is called (it must NOT be).
+        ak.get_product_model = lambda code: self.fail(  # type: ignore[assignment]
+            "Standalone product must not trigger a parent-model lookup"
+        )
+
+        product = {"identifier": "GH-LCF-KD353", "parent": None, "values": {}}
+        data, ident, kind = ak.resolve_photo_target(product, "product")
+        self.assertEqual(kind, "product")
+        self.assertEqual(ident, "GH-LCF-KD353")
+        self.assertIs(data, product)
+
+    def test_product_has_actual_photos_still_works(self) -> None:
+        """Backward-compat: the older boolean helper is still accurate."""
+        client = self._make_client()
+        all_filled = {
+            "values": {
+                attr: [{"scope": None, "data": f"{attr}.jpg"}]
+                for attr in ("Actual_Photo", "another_picture_5", "another_picture_6")
+            }
+        }
+        one_filled = {
+            "values": {
+                "Actual_Photo": [{"scope": None, "data": "x.jpg"}],
+            }
+        }
+        none_filled = {"values": {}}
+        attrs = ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        self.assertTrue(client.product_has_actual_photos(all_filled, attrs))
+        self.assertTrue(client.product_has_actual_photos(one_filled, attrs))
+        self.assertFalse(client.product_has_actual_photos(none_filled, attrs))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -331,6 +331,54 @@ class AkeneoClient:
         ) or sku
         return data, akeneo_id, kind
 
+    def resolve_photo_target(
+        self,
+        entity_data: dict[str, Any] | None,
+        kind: str,
+    ) -> tuple[dict[str, Any] | None, str, str]:
+        """Return the entity that owns the actual-photo attributes.
+
+        Variant products (those with a non-empty ``parent`` field) do not
+        own model-level attributes such as ``Actual_Photo`` /
+        ``another_picture_5`` / ``another_picture_6``; those live on the
+        parent product model. Calling this helper before reading or
+        writing photo values ensures we operate on the entity that
+        actually stores them.
+
+        For standalone products and bare product models the input is
+        returned unchanged.
+
+        Returns ``(target_data, target_id, target_kind)``.
+        """
+        if not entity_data:
+            return entity_data, "", kind
+        if kind != "product":
+            return entity_data, entity_data.get("code", ""), kind
+
+        parent_code = (entity_data.get("parent") or "").strip()
+        if not parent_code:
+            return entity_data, entity_data.get("identifier", ""), kind
+
+        parent = self.get_product_model(parent_code)
+        if not parent:
+            logger.warning(
+                "Product %s declares parent product-model %s but it was "
+                "not found; using the variant for photo upload (likely "
+                "to fail).",
+                entity_data.get("identifier"),
+                parent_code,
+            )
+            return entity_data, entity_data.get("identifier", ""), kind
+
+        logger.info(
+            "Photo target redirected: variant %s -> product-model %s "
+            "(family_variant=%s)",
+            entity_data.get("identifier"),
+            parent_code,
+            entity_data.get("family_variant"),
+        )
+        return parent, parent.get("code", parent_code), "product_model"
+
     def product_has_actual_photos(
         self,
         product_data: dict[str, Any],
@@ -338,15 +386,36 @@ class AkeneoClient:
         scope: str | None = None,
     ) -> bool:
         """Check if any of the actual photo attributes already have data."""
+        return len(
+            self.find_empty_photo_slots(product_data, attribute_codes, scope)
+        ) < len(attribute_codes)
+
+    def find_empty_photo_slots(
+        self,
+        product_data: dict[str, Any],
+        attribute_codes: list[str],
+        scope: str | None = None,
+    ) -> list[str]:
+        """Return attribute codes whose value is empty (no media file).
+
+        Preserves the order of ``attribute_codes`` so callers can fill
+        slots in a predictable priority (e.g. Actual_Photo first,
+        then another_picture_5, then another_picture_6).
+        """
         values = product_data.get("values", {})
+        empty: list[str] = []
         for attr_code in attribute_codes:
-            attr_values = values.get(attr_code, [])
-            for entry in attr_values:
+            entries = values.get(attr_code, [])
+            has_data = False
+            for entry in entries:
                 if scope and entry.get("scope") != scope:
                     continue
                 if entry.get("data"):
-                    return True
-        return False
+                    has_data = True
+                    break
+            if not has_data:
+                empty.append(attr_code)
+        return empty
 
     def _upload_media_raw(self, file_path: Path) -> str | None:
         """Upload a media file without product association. Returns the media file path or None."""

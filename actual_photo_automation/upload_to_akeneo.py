@@ -329,37 +329,80 @@ def process_records(
             akeneo_id,
         )
 
-        # Check if product already has actual photos
-        if akeneo.product_has_actual_photos(product_data, photo_attributes):
-            logger.info("Skipping %s: already has actual photos in Akeneo", akeneo_id)
+        # Variant products do not own model-level photo attributes; resolve
+        # to the parent product model so the upload target is the entity
+        # that actually stores the photos.
+        product_data, akeneo_id, product_type = akeneo.resolve_photo_target(
+            product_data, product_type
+        )
+
+        # Per-slot fill-empty: only upload to attributes that are currently
+        # empty in Akeneo. Existing photos in any slot are preserved. The
+        # whole product is skipped only when every slot is already filled.
+        empty_slots = akeneo.find_empty_photo_slots(product_data, photo_attributes)
+        if not empty_slots:
+            logger.info(
+                "Skipping %s: all %d actual photo slot(s) already filled in Akeneo",
+                akeneo_id, len(photo_attributes),
+            )
             counts["skipped"] += 1
             append_csv_report(
-                report_path, product_name, akeneo_id, "already_has_photos",
+                report_path, product_name, akeneo_id, "all_slots_filled",
                 photo_1="existing", photo_2="existing", photo_3="existing",
-                notes="Product already has actual photos",
+                notes=(
+                    f"All {len(photo_attributes)} Akeneo actual photo slot(s) "
+                    f"already filled; nothing uploaded."
+                ),
             )
+            if remarks_field:
+                try:
+                    creator.update_record(
+                        crm_app, encoding_report, record_id,
+                        {remarks_field: (
+                            f"Akeneo upload skipped: all {len(photo_attributes)} "
+                            f"actual photo slot(s) already filled."
+                        )},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to write Akeneo skip remark for %s: %s",
+                        record_id, exc,
+                    )
             state["uploaded"][record_id] = {
                 "product_name": product_name,
                 "akeneo_id": akeneo_id,
-                "status": "already_has_photos",
+                "status": "all_slots_filled",
                 "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             save_state(state, state_path)
             continue
 
-        # Download and upload photos
-        uploaded_files = ["", "", ""]
+        # Pre-fill CSV row positions so each column tracks the same slot
+        # across runs. "existing" means we left that slot alone because it
+        # already had a photo on the Akeneo side.
+        uploaded_files = [
+            "existing" if attr not in empty_slots else ""
+            for attr in photo_attributes
+        ]
         upload_success = True
+        new_uploads = 0
+
+        # Pair each available source photo with the next empty slot.
+        slots_to_fill = empty_slots[: len(file_paths)]
+        files_for_slots = file_paths[: len(empty_slots)]
+
+        logger.info(
+            "%s: %d slot(s) empty (%s), %d source photo(s) available; "
+            "will upload %d photo(s)",
+            akeneo_id, len(empty_slots), ", ".join(empty_slots),
+            len(file_paths), len(slots_to_fill),
+        )
 
         with TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
 
-            for idx, fp in enumerate(file_paths[:3]):
-                attr_code = photo_attributes[idx] if idx < len(photo_attributes) else None
-                if not attr_code:
-                    logger.warning("No attribute code for photo index %d, skipping", idx)
-                    break
-
+            for fp, attr_code in zip(files_for_slots, slots_to_fill):
+                slot_idx = photo_attributes.index(attr_code)
                 try:
                     dest = tmp_path / fp
                     downloaded = creator.download_file_field_to_path(
@@ -381,32 +424,39 @@ def process_records(
                         locale=None,
                     )
                     if response.status_code == 201:
-                        uploaded_files[idx] = downloaded.name
+                        uploaded_files[slot_idx] = downloaded.name
+                        new_uploads += 1
                     else:
                         upload_success = False
-                        uploaded_files[idx] = f"FAILED:{response.status_code}"
+                        uploaded_files[slot_idx] = f"FAILED:{response.status_code}"
                         logger.error(
                             "Upload failed for %s -> %s.%s: %s",
                             downloaded.name, akeneo_id, attr_code, response.text[:300],
                         )
                 except Exception as exc:
                     upload_success = False
-                    uploaded_files[idx] = f"ERROR:{exc}"
+                    uploaded_files[slot_idx] = f"ERROR:{exc}"
                     logger.exception(
-                        "Error processing photo %d for %s", idx + 1, product_name
+                        "Error uploading to %s.%s for %s",
+                        akeneo_id, attr_code, product_name,
                     )
 
-        if upload_success and any(f and not f.startswith(("FAILED:", "ERROR:")) for f in uploaded_files):
+        preserved = sum(1 for f in uploaded_files if f == "existing")
+        if upload_success and new_uploads > 0:
             counts["uploaded"] += 1
             status = "uploaded"
+            preserved_note = f", kept {preserved} existing" if preserved else ""
             remark_note = (
                 f"Akeneo upload OK: {product_type} {akeneo_id} "
-                f"({sum(1 for f in uploaded_files if f and not f.startswith(('FAILED:', 'ERROR:')))} photo(s))"
+                f"({new_uploads} new photo(s){preserved_note})"
             )
         else:
             counts["error"] += 1
             status = "error"
-            failures = "; ".join(f for f in uploaded_files if f and f.startswith(("FAILED:", "ERROR:"))) or "unknown error"
+            failures = "; ".join(
+                f for f in uploaded_files
+                if f and f.startswith(("FAILED:", "ERROR:"))
+            ) or "no uploads attempted"
             remark_note = f"Akeneo upload failed - manual check needed ({failures})"
 
         append_csv_report(
