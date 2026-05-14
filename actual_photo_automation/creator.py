@@ -254,3 +254,13 @@ class ZohoCreator:
             f'({item_field}.contains("{escaped_name}")'
             f' && {status_field} == "{escaped_status}")'
         )
+
+    def build_archive_criteria_by_sku(self, sku_value: str, status_value: str) -> str:
+        sku_field = self.config.get("archive_sku_field", "SKU")
+        status_field = self.config["archive_status_field"]
+        escaped_sku = creator_criteria_value(sku_value)
+        escaped_status = creator_criteria_value(status_value)
+        return (
+            f'({sku_field} == "{escaped_sku}"'
+            f' && {status_field} == "{escaped_status}")'
+        )

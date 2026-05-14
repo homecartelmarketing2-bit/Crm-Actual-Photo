@@ -64,6 +64,14 @@ CONFIG: dict[str, Any] = {
         os.getenv("ZOHO_WORKDRIVE_SEARCH_RESULT_LIMIT", "25")
     ),
     "field_product_name": os.getenv("FIELD_PRODUCT_NAME", "Product_Name"),
+    # Subform holding (Items, SKU) rows on each Encoding Request record.
+    # Legacy flat "Product_Name" is empty for newer rows; real data lives here.
+    "field_request_items_subform": os.getenv(
+        "FIELD_REQUEST_ITEMS_SUBFORM", "Product_Name1"
+    ),
+    "subform_item_field": os.getenv("SUBFORM_ITEM_FIELD", "Items"),
+    "subform_item_name_field": os.getenv("SUBFORM_ITEM_NAME_FIELD", "Item_Name"),
+    "subform_sku_field": os.getenv("SUBFORM_SKU_FIELD", "SKU"),
     "field_request_type": os.getenv("FIELD_REQUEST_TYPE", "Type_of_Request"),
     "field_request_status": os.getenv("FIELD_REQUEST_STATUS", "Request_Status"),
     "field_actual_media": os.getenv("FIELD_ACTUAL_MEDIA", ""),
@@ -74,6 +82,11 @@ CONFIG: dict[str, Any] = {
     "field_remarks": os.getenv("FIELD_REMARKS", "Remarks_Notes"),
     "request_type_value": os.getenv("REQUEST_TYPE_VALUE", "Actual Photo"),
     "request_done_value": os.getenv("REQUEST_DONE_VALUE", "Done"),
+    # Status value to set when no media is found in any source.
+    # Must match an option in the Creator Request_Status picklist.
+    "request_not_available_value": os.getenv(
+        "REQUEST_NOT_AVAILABLE_VALUE", "Not available"
+    ),
     "request_open_values": [
         value.strip()
         for value in os.getenv("REQUEST_OPEN_VALUES", "Pending,In progress").split(",")
@@ -83,6 +96,9 @@ CONFIG: dict[str, Any] = {
         "SUCCESS_REMARKS", "This is uploaded by Automated"
     ),
     "archive_item_name_field": os.getenv("ARCHIVE_ITEM_NAME_FIELD", "Item_Name"),
+    # Archive lookups now use SKU (per request). Set ARCHIVE_SKU_FIELD if the
+    # archive form labels its SKU column differently.
+    "archive_sku_field": os.getenv("ARCHIVE_SKU_FIELD", "SKU"),
     "archive_status_field": os.getenv("ARCHIVE_STATUS_FIELD", "Pasado_ba_sa_Quality_Check"),
     "archive_approved_value": os.getenv("ARCHIVE_APPROVED_VALUE", "Approve"),
     "archive_media_fields": [
