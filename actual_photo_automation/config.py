@@ -64,6 +64,17 @@ CONFIG: dict[str, Any] = {
         os.getenv("ZOHO_WORKDRIVE_SEARCH_RESULT_LIMIT", "25")
     ),
     "field_product_name": os.getenv("FIELD_PRODUCT_NAME", "Product_Name"),
+    # Fallback subform that holds product items when the primary text
+    # field is empty (e.g. multi-item Actual Photo requests in Zoho Creator).
+    "field_product_name_subform": os.getenv(
+        "FIELD_PRODUCT_NAME_SUBFORM", "Product_Name1"
+    ),
+    # Dotted path inside each subform row to extract the product name from
+    # (e.g. row['Items']['Item_Name']). Set to an empty string to fall back to
+    # the row's display value.
+    "field_product_name_subform_key": os.getenv(
+        "FIELD_PRODUCT_NAME_SUBFORM_KEY", "Items.Item_Name"
+    ),
     "field_request_type": os.getenv("FIELD_REQUEST_TYPE", "Type_of_Request"),
     "field_request_status": os.getenv("FIELD_REQUEST_STATUS", "Request_Status"),
     "field_actual_media": os.getenv("FIELD_ACTUAL_MEDIA", ""),

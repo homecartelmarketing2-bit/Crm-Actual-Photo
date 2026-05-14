@@ -20,6 +20,8 @@ BASE_CONFIG = {
     "field_actual_media": "",
     "field_image_media": "Actual_Photo1",
     "field_product_name": "Product_Name",
+    "field_product_name_subform": "Product_Name1",
+    "field_product_name_subform_key": "Items.Item_Name",
     "field_remarks": "Remarks_Notes",
     "field_request_status": "Request_Status",
     "field_request_type": "Type_of_Request",
@@ -88,12 +90,22 @@ class CreatorSpy:
 
 
 class WorkDriveStub:
-    def __init__(self, match: MatchResult | None = None):
+    def __init__(
+        self,
+        match: MatchResult | None = None,
+        *,
+        match_by_search_term: dict[str, MatchResult] | None = None,
+    ):
         self.match = match
+        self.match_by_search_term = match_by_search_term or {}
         self.calls: list[dict] = []
 
     def find_best_media_match(self, *args, **kwargs):
         self.calls.append({"args": args, "kwargs": kwargs})
+        if self.match_by_search_term:
+            search_terms = args[1] if len(args) > 1 else kwargs.get("search_terms")
+            key = getattr(search_terms, "original", search_terms)
+            return self.match_by_search_term.get(key)
         return self.match
 
 
@@ -190,6 +202,104 @@ class AutomationRulesTests(unittest.TestCase):
             "Done",
         )
         self.assertIn("Automated retrieval of actual photos/videos", creator.update_calls[0]["data"]["Remarks_Notes"])
+
+    def test_process_record_reads_product_name_from_subform(self) -> None:
+        creator = CreatorSpy()
+        match = MatchResult(
+            source="workdrive",
+            matched_name="Ashura",
+            media=(MediaCandidate(source="workdrive", identifier="file-1", name="ashura.jpg"),),
+        )
+        automation = self._make_automation(
+            creator=creator,
+            workdrive=WorkDriveStub(match=match),
+        )
+        record = {
+            "ID": "100",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "Items": {"Item_Name": "Ashura | Modern LED Wall Light"},
+                    "SKU": "F028-M-chrome",
+                }
+            ],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.product_name, "Ashura | Modern LED Wall Light")
+        self.assertEqual(outcome.uploaded_count, 1)
+        self.assertEqual(len(creator.upload_calls), 1)
+
+    def test_process_record_subform_with_multiple_items_aggregates_media(self) -> None:
+        creator = CreatorSpy()
+        match_a = MatchResult(
+            source="workdrive",
+            matched_name="Rhosyn 22",
+            media=(MediaCandidate(source="workdrive", identifier="file-a", name="rhosyn-22.jpg"),),
+        )
+        match_b = MatchResult(
+            source="workdrive",
+            matched_name="Rhosyn 30",
+            media=(MediaCandidate(source="workdrive", identifier="file-b", name="rhosyn-30.jpg"),),
+        )
+        workdrive = WorkDriveStub(
+            match_by_search_term={
+                "Rhosyn | Alabaster Wall Light D22 H23cm": match_a,
+                "Rhosyn | Alabaster Wall Light D22 H30cm": match_b,
+            }
+        )
+        automation = self._make_automation(creator=creator, workdrive=workdrive)
+        record = {
+            "ID": "200",
+            "Product_Name": "",
+            "Product_Name1": [
+                {"Items": {"Item_Name": "Rhosyn | Alabaster Wall Light D22 H23cm"}},
+                {"Items": {"Item_Name": "Rhosyn | Alabaster Wall Light D22 H30cm"}},
+            ],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.uploaded_count, 2)
+        self.assertEqual(
+            sorted(call["upload_name"] for call in creator.upload_calls),
+            ["rhosyn-22.jpg", "rhosyn-30.jpg"],
+        )
+        # WorkDrive lookup is performed once per subform item
+        self.assertEqual(len(workdrive.calls), 2)
+        self.assertEqual(
+            creator.update_calls[-1]["data"]["Request_Status"], "Done",
+        )
+
+    def test_process_record_warns_when_no_product_name_anywhere(self) -> None:
+        creator = CreatorSpy()
+        automation = self._make_automation(creator=creator)
+        record = {
+            "ID": "300",
+            "Product_Name": "",
+            "Product_Name1": [],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.product_name, "")
+        self.assertEqual(outcome.source, "none")
+        self.assertEqual(outcome.uploaded_count, 0)
+        self.assertEqual(creator.upload_calls, [])
+        self.assertEqual(creator.update_calls, [])
 
     def test_process_record_failed_upload_does_not_mark_done(self) -> None:
         creator = CreatorSpy(upload_error=RuntimeError("upload failed"))
