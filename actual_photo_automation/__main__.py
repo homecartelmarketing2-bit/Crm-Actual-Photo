@@ -5,6 +5,14 @@ import json
 import logging
 import sys
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
 from .automation import ActualPhotoAutomation
 from .config import configure_logging, load_config, validate_config
 from .video_browser import VideoBrowserApp
