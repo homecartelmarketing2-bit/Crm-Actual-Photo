@@ -310,15 +310,56 @@ class ActualPhotoAutomation:
         }
         self._save_state()
 
+    def _extract_product_names(self, record: dict[str, Any]) -> list[str]:
+        """Return the product names to search for on a single record.
+
+        Falls back to the configured subform (default ``Product_Name1``) when
+        the legacy plain-text field (default ``Product_Name``) is empty, which
+        happens for multi-item Actual Photo requests in newer Zoho Creator
+        forms.
+        """
+        primary = scalar_to_text(record.get(self.config["field_product_name"]))
+        if primary:
+            return [primary]
+
+        subform_field = str(self.config.get("field_product_name_subform", "")).strip()
+        if not subform_field:
+            return []
+        subform = record.get(subform_field)
+        if not isinstance(subform, list):
+            return []
+
+        key_path = str(self.config.get("field_product_name_subform_key", "")).strip()
+        keys = [part for part in key_path.split(".") if part]
+
+        names: list[str] = []
+        for item in subform:
+            if not isinstance(item, dict):
+                continue
+            value: Any = item
+            for key in keys:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(key)
+            name = scalar_to_text(value)
+            if not name:
+                # Fallback: use the row's own display value
+                name = scalar_to_text(item)
+            if name and name not in names:
+                names.append(name)
+        return names
+
     def process_record(
         self, record: dict[str, Any], *, dry_run: bool = False
     ) -> ProcessingOutcome:
         record_id = extract_record_id(record)
-        product_name = scalar_to_text(record.get(self.config["field_product_name"]))
-        if not product_name:
+        product_names = self._extract_product_names(record)
+        if not product_names:
             message = "Automation could not determine Product Name."
             logger.warning("%s Record=%s", message, record_id)
             return ProcessingOutcome(record_id, "", 0, "none", message)
+        product_name = "; ".join(product_names)
 
         request_type = scalar_to_text(record.get(self.config["field_request_type"]))
         expected_type = scalar_to_text(self.config.get("request_type_value", ""))
@@ -348,33 +389,45 @@ class ActualPhotoAutomation:
                 logger.info("%s (record=%s, product=%s)", message, record_id, product_name)
                 return ProcessingOutcome(record_id, product_name, 0, "skip", message)
 
-        search_terms = build_search_terms(product_name)
         all_media: list[MediaCandidate] = []
         sources: list[str] = []
-        matched_name = ""
+        matched_names: list[str] = []
 
-        workdrive_match = self.workdrive.find_best_media_match(
-            self.config["workdrive_parent_folder_id"],
-            search_terms,
-            max_depth=int(self.config["workdrive_search_depth"]),
-            parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
-        )
-        if workdrive_match and workdrive_match.media:
-            all_media.extend(workdrive_match.media)
-            sources.append("workdrive")
-            matched_name = workdrive_match.matched_name
-            logger.info("Found %d file(s) in WorkDrive for %s", len(workdrive_match.media), product_name)
+        for single_name in product_names:
+            search_terms = build_search_terms(single_name)
 
-        archive_match = self.find_archive_match(product_name)
-        if archive_match and archive_match.media:
-            all_media.extend(archive_match.media)
-            sources.append("archive")
-            if not matched_name:
-                matched_name = archive_match.matched_name
-            logger.info("Found %d file(s) in Archive for %s", len(archive_match.media), product_name)
+            workdrive_match = self.workdrive.find_best_media_match(
+                self.config["workdrive_parent_folder_id"],
+                search_terms,
+                max_depth=int(self.config["workdrive_search_depth"]),
+                parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
+            )
+            if workdrive_match and workdrive_match.media:
+                all_media.extend(workdrive_match.media)
+                if "workdrive" not in sources:
+                    sources.append("workdrive")
+                if workdrive_match.matched_name:
+                    matched_names.append(workdrive_match.matched_name)
+                logger.info(
+                    "Found %d file(s) in WorkDrive for %s",
+                    len(workdrive_match.media), single_name,
+                )
+
+            archive_match = self.find_archive_match(single_name)
+            if archive_match and archive_match.media:
+                all_media.extend(archive_match.media)
+                if "archive" not in sources:
+                    sources.append("archive")
+                if archive_match.matched_name:
+                    matched_names.append(archive_match.matched_name)
+                logger.info(
+                    "Found %d file(s) in Archive for %s",
+                    len(archive_match.media), single_name,
+                )
 
         all_media = unique_media(all_media)
         source_label = "+".join(sources) if sources else "none"
+        matched_name = "; ".join(dict.fromkeys(matched_names))
 
         # Generate custom remarks dynamically based on matched sources
         source_names_map = {"archive": "Kanban Notes", "workdrive": "Zoho Drive", "akeneo": "Akeneo"}
@@ -515,7 +568,7 @@ class ActualPhotoAutomation:
             filter_lower = product_filter.lower()
             records = [
                 r for r in records
-                if filter_lower in scalar_to_text(r.get(self.config["field_product_name"])).lower()
+                if any(filter_lower in name.lower() for name in self._extract_product_names(r))
             ]
             logger.info("Filtered to %s record(s) matching '%s'", len(records), product_filter)
         # Filter out already-processed records early to save API calls
